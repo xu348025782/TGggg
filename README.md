@@ -2,14 +2,17 @@
 
 去 https://my.telegram.org 申请 api_id / api_hash
 目标频道提前绑好讨论组，你的号是那个频道的管理员
+
 2. 装环境，一次粘贴回车
 
 Debian / Ubuntu 的服务器用这组：
 
 apt update && apt install -y python3 python3-venv python3-pip git curl
+
 Alpine 的服务器用这组：
 
 apk add python3 py3-pip git curl
+
 3. 从 GitHub 拉代码
 
 mkdir -p ~/copy-thread && cd ~/copy-thread
