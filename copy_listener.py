@@ -436,9 +436,30 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                             has_comments = True
                             print(f"扫附近拿到源评论共 {len(comments)} 条", flush=True)
                         else:
-                            print("源帖没有评论串，只搬帖子本身", flush=True)
-                            comments = []
-                            has_comments = False
+                            print("没找到回复主帖的，改用扫后面紧挨着的内容试试……", flush=True)
+                            try:
+                                async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 50):
+                                    if _m.id == src_post_id:
+                                        continue
+                                    _txt = _m.text or ""
+                                    if "#" in _txt:
+                                        break
+                                    if _m.media:
+                                        comments.append(_m)
+                                        if limit and len(comments) >= limit:
+                                            break
+                                if comments:
+                                    comments.reverse()
+                                    has_comments = True
+                                    print(f"扫后面紧挨着拿到源内容共 {len(comments)} 条", flush=True)
+                                else:
+                                    print("源帖没有评论串，只搬帖子本身", flush=True)
+                                    comments = []
+                                    has_comments = False
+                            except Exception as e5:
+                                print(f"源帖没有评论串（{e5}），只搬帖子本身", flush=True)
+                                comments = []
+                                has_comments = False
                     except Exception as e4:
                         print(f"源帖没有评论串（{e4}），只搬帖子本身", flush=True)
                         comments = []
@@ -488,9 +509,32 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                         has_comments = True
                         print(f"扫附近拿到源评论共 {len(comments)} 条", flush=True)
                     else:
-                        print("源帖没有评论串，只搬帖子本身", flush=True)
-                        comments = []
-                        has_comments = False
+                        print("没找到回复主帖的，改用扫后面紧挨着的内容试试……", flush=True)
+                        # 第五办法：后面紧挨着的、只有图没话题的，当成这个总览的内容
+                        # 遇到带 #话题 的就停，那是下一个总览
+                        try:
+                            async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 50):
+                                if _m.id == src_post_id:
+                                    continue
+                                _txt = _m.text or ""
+                                if "#" in _txt:
+                                    break
+                                if _m.media:
+                                    comments.append(_m)
+                                    if limit and len(comments) >= limit:
+                                        break
+                            if comments:
+                                comments.reverse()
+                                has_comments = True
+                                print(f"扫后面紧挨着拿到源内容共 {len(comments)} 条", flush=True)
+                            else:
+                                print("源帖没有评论串，只搬帖子本身", flush=True)
+                                comments = []
+                                has_comments = False
+                        except Exception as e5:
+                            print(f"源帖没有评论串（{e5}），只搬帖子本身", flush=True)
+                            comments = []
+                            has_comments = False
                 except Exception as e4:
                     print(f"源帖没有评论串（{e4}），只搬帖子本身", flush=True)
                     comments = []
