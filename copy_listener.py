@@ -177,9 +177,14 @@ def extract_buttons(msg):
 
 def extract_entities(msg):
     """源帖标题里的格式（第 2 种）：一个字下面藏着链接、加粗等。
-    直接用原消息的 entities，send 时加 formatting_entities + parse_mode=None 原样搬。"""
+    直接用原消息的 entities，send 时加 formatting_entities + parse_mode=None 原样搬。
+    只留 #话题 和链接（能点、能搜），加粗/引用这些会多出 ** 和引用框，就不要了。"""
     ents = getattr(msg, "entities", None)
-    return list(ents) if ents else None
+    if not ents:
+        return None
+    keep = ("MessageEntityHashtag", "MessageEntityMention", "MessageEntityTextUrl", "MessageEntityUrl")
+    out = [e for e in ents if type(e).__name__ in keep]
+    return out or None
 
 
 async def send_with_floodwait(coro_factory, what="发送"):
