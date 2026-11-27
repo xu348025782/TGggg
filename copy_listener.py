@@ -395,9 +395,25 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
         else:
             print("源帖没有评论串，只搬帖子本身", flush=True)
     except Exception as e:
-        print(f"源帖没有评论串（{e}），只搬帖子本身", flush=True)
-        comments = []
-        has_comments = False
+        print(f"GetDiscussionMessage 失败（{e}），改用直接读回复试试……", flush=True)
+        # 备用办法：直接按 reply_to 读评论，有些频道 GetDiscussionMessage 拿不到，但直接读回复能拿到
+        try:
+            async for m in client.iter_messages(src_entity, reply_to=src_post_id):
+                comments.append(m)
+                if limit and len(comments) >= limit:
+                    break
+            if comments:
+                comments.reverse()
+                has_comments = True
+                print(f"直接读回复拿到源评论共 {len(comments)} 条", flush=True)
+            else:
+                print("源帖没有评论串，只搬帖子本身", flush=True)
+                comments = []
+                has_comments = False
+        except Exception as e2:
+            print(f"源帖没有评论串（{e2}），只搬帖子本身", flush=True)
+            comments = []
+            has_comments = False
 
     # 目标频道发新帖（重新下载再上传，不带转发来源）
     # 第 2 种：标题里一个字下面藏着链接、加粗等，用原 entities 原样搬
