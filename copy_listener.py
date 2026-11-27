@@ -69,12 +69,13 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetDiscussionMessageRequest
 from telethon.tl.types import PeerChannel
 
 DEST_FILE = Path("dest_channel.txt")
+SETTINGS_FILE = Path("settings.json")
 
 
 def load_dest_from_file():
@@ -86,6 +87,24 @@ def load_dest_from_file():
 
 def save_dest_to_file(value):
     DEST_FILE.write_text(str(value), encoding="utf-8")
+
+
+def load_settings():
+    """settings.json：绑定频道 + 全部可改设置，重启也记得住。"""
+    try:
+        d = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(d, dict):
+            return d
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def save_settings(d):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def parse_dest(value: str):
@@ -135,6 +154,32 @@ def author_name(msg):
     first = getattr(sender, "first_name", "") or ""
     last = getattr(sender, "last_name", "") or ""
     return (first + " " + last).strip() or getattr(sender, "username", "") or ""
+
+
+def extract_buttons(msg):
+    """源帖下面的 inline 按钮（第 3 种）：只搬 URL 按钮，回调按钮搬不了就跳过。
+    返回 Telethon 的 Button 列表，没有就返回 None。"""
+    markup = getattr(msg, "reply_markup", None)
+    if not markup or not getattr(markup, "rows", None):
+        return None
+    rows = []
+    for row in markup.rows:
+        brow = []
+        for b in getattr(row, "buttons", []):
+            url = getattr(b, "url", None)
+            text = getattr(b, "text", "") or ""
+            if url and text:
+                brow.append(Button.url(text, url))
+        if brow:
+            rows.append(brow)
+    return rows or None
+
+
+def extract_entities(msg):
+    """源帖标题里的格式（第 2 种）：一个字下面藏着链接、加粗等。
+    直接用原消息的 entities，send 时加 formatting_entities + parse_mode=None 原样搬。"""
+    ents = getattr(msg, "entities", None)
+    return list(ents) if ents else None
 
 
 async def send_with_floodwait(coro_factory, what="发送"):
@@ -350,6 +395,10 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
         has_comments = False
 
     # 目标频道发新帖（重新下载再上传，不带转发来源）
+    # 第 2 种：标题里一个字下面藏着链接、加粗等，用原 entities 原样搬
+    # 第 3 种：图片下面的 inline 按钮，只搬 URL 按钮
+    src_entities = extract_entities(src_group[0])
+    src_buttons = extract_buttons(src_group[0])
     if src_post.media:
         src_files = []
         caption = src_group[0].text or None
@@ -370,25 +419,36 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
         try:
             if len(src_files) == 1:
                 dest_post = await send_with_floodwait(
-                    lambda: client.send_file(dest_channel, src_files[0], caption=caption),
+                    lambda: client.send_file(dest_channel, src_files[0], caption=caption,
+                                             formatting_entities=src_entities, parse_mode=None,
+                                             buttons=src_buttons),
                     "发新帖")
             else:
                 # 相册：最多 10 张一批，超了拆批（第一批带标题）
                 dest_post = None
                 for batch_no, batch in enumerate(chunks(src_files, 10), 1):
                     cap = caption if batch_no == 1 else None
+                    # 标题、链接、按钮只在第一批带，后面的批不带
+                    cap_ents = src_entities if batch_no == 1 else None
+                    cap_btns = src_buttons if batch_no == 1 else None
                     batch_mb = sum(Path(p).stat().st_size for p in batch if Path(p).exists()) / (1024 * 1024)
                     if batch_mb > max_cache_mb and len(batch) > 1:
                         for single in batch:
                             r = await send_with_floodwait(
-                                lambda: client.send_file(dest_channel, single, caption=cap),
+                                lambda: client.send_file(dest_channel, single, caption=cap,
+                                                         formatting_entities=cap_ents, parse_mode=None,
+                                                         buttons=cap_btns),
                                 "发新帖单张")
                             cap = None
+                            cap_ents = None
+                            cap_btns = None
                             if dest_post is None:
                                 dest_post = r
                     else:
                         r = await send_with_floodwait(
-                            lambda: client.send_file(dest_channel, batch, caption=cap),
+                            lambda: client.send_file(dest_channel, batch, caption=cap,
+                                                     formatting_entities=cap_ents, parse_mode=None,
+                                                     buttons=cap_btns),
                             "发新帖")
                         if dest_post is None:
                             # send_file 传列表时返回的是 list，取第一条当新帖 ID
@@ -397,7 +457,9 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
             delete_files(src_files)
     else:
         dest_post = await send_with_floodwait(
-            lambda: client.send_message(dest_channel, src_post.text or "(无文字)"),
+            lambda: client.send_message(dest_channel, src_post.text or "(无文字)",
+                                        formatting_entities=src_entities, parse_mode=None,
+                                        buttons=src_buttons),
             "发新帖")
     print(f"目标新帖已发：{dest_post.id}", flush=True)
 
@@ -430,6 +492,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
             await asyncio.sleep(1)
             continue
         files, caption = [], group[0].text or None
+        cap_ents = extract_entities(group[0])
         skipped = 0
         for m in group:
             if m.media:
@@ -451,18 +514,23 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
             try:
                 if batch_mb > max_cache_mb and len(batch) > 1:
                     cap = caption
+                    cap_e = cap_ents
                     for single in batch:
                         await send_with_floodwait(
                             lambda: client.send_file(dest_channel, single, caption=cap,
+                                                     formatting_entities=cap_e, parse_mode=None,
                                                      comment_to=dest_post.id),
                             f"媒体评论 {gi} 单张")
                         cap = None
+                        cap_e = None
                         delete_files([single])
                         await asyncio.sleep(1)
                 else:
                     await send_with_floodwait(
                         lambda: client.send_file(dest_channel, batch,
                                                  caption=caption if batch_no == 1 else None,
+                                                 formatting_entities=cap_ents if batch_no == 1 else None,
+                                                 parse_mode=None,
                                                  comment_to=dest_post.id),
                         f"媒体评论 {gi} 第 {batch_no} 批")
             finally:
@@ -489,6 +557,10 @@ async def main():
                     help="手机号，带 +86，如 +86138xxxxxxx。不填就运行时问你")
     ap.add_argument("--force-sms", action="store_true",
                     help="默认强制走应用内消息（777000），不走短信。加这个才强制走短信")
+    ap.add_argument("--bot-token", default=os.environ.get("TG_BOT_TOKEN", ""),
+                    help="Bot Token（BotFather 建的真 Bot）。给了就开启 Bot 触发：把帖子转发给这个 Bot 就开始搬，转发到 Bot 会带来源，第三方转发到收藏夹不带来源时用这个")
+    ap.add_argument("--bot-session", default="bot_listener",
+                    help="Bot 的 session 文件名，默认 bot_listener")
     ap.add_argument("--session", default="copy_listener")
     ap.add_argument("--limit", type=int, default=0, help="每条只搬前 N 条评论，0 = 全部")
     ap.add_argument("--max-file-mb", type=int, default=10240, help="单个文件超过这个 MB 就跳过，默认 10240（10G）")
@@ -506,16 +578,33 @@ async def main():
     # 命令行传了重置日就存下来，之后 /set_traffic_day 和重启都记得住
     if args.traffic_reset_day is not None:
         save_traffic_state(args.traffic_file, traffic_state)
-    if args.traffic_limit_gb:
-        _nxt = next_reset_for(datetime.now(TZ).date(), traffic_state["reset_day"])
-        print(f"流量：本账期 {traffic_state['month']} 起已用 {traffic_state['used'] / 1024**3:.2f}GB / "
-              f"限额 {args.traffic_limit_gb}GB（{args.traffic_mode}，x{traffic_mult(args.traffic_mode)}），"
-              f"每月 {traffic_state['reset_day']} 号清零，下次 {_nxt}，"
-              f"每日 {args.daily_report_hour} 点自动推昨日统计", flush=True)
 
     if not args.api_id or not args.api_hash:
         print("缺 api_id / api_hash", file=sys.stderr)
         sys.exit(2)
+    # 全部可改设置：先读 settings.json 里存的，再用启动参数覆盖（启动参数只在第一次有用，之后以 Bot 菜单改的为准）
+    _saved_settings = load_settings()
+    settings_holder = {
+        "traffic_limit_gb": float(_saved_settings.get("traffic_limit_gb", args.traffic_limit_gb or 6000)),
+        "traffic_mode": _saved_settings.get("traffic_mode", args.traffic_mode or "both"),
+        "max_file_mb": int(_saved_settings.get("max_file_mb", args.max_file_mb or 10240)),
+        "max_cache_mb": int(_saved_settings.get("max_cache_mb", args.max_cache_mb or 10240)),
+        "min_free_mb": int(_saved_settings.get("min_free_mb", args.min_free_mb or 500)),
+        "daily_report_hour": int(_saved_settings.get("daily_report_hour", args.daily_report_hour if args.daily_report_hour is not None else 8)),
+        "bound_channels": list(_saved_settings.get("bound_channels", []) or []),
+    }
+    # 启动参数如果和默认值不一样，说明这次是特意传的，存下来
+    if args.traffic_limit_gb:
+        settings_holder["traffic_limit_gb"] = float(args.traffic_limit_gb)
+    if args.traffic_mode:
+        settings_holder["traffic_mode"] = args.traffic_mode
+    save_settings(settings_holder)
+    if settings_holder["traffic_limit_gb"]:
+        _nxt = next_reset_for(datetime.now(TZ).date(), traffic_state["reset_day"])
+        print(f"流量：本账期 {traffic_state['month']} 起已用 {traffic_state['used'] / 1024**3:.2f}GB / "
+              f"限额 {settings_holder['traffic_limit_gb']}GB（{settings_holder['traffic_mode']}，x{traffic_mult(settings_holder['traffic_mode'])}），"
+              f"每月 {traffic_state['reset_day']} 号清零，下次 {_nxt}，"
+              f"每日 {settings_holder['daily_report_hour']} 点自动推昨日统计", flush=True)
     dest_arg = (args.dest_channel or "").strip()
     if dest_arg:
         dest_channel = parse_dest(dest_arg)
@@ -562,6 +651,17 @@ async def main():
         print("用法：把喜欢的频道帖子转发给这个号，或把帖子链接发给它。", flush=True)
     print("设频道：在 Telegram 里发 /set_dest @新频道 即可，不用上服务器。", flush=True)
 
+    # Bot 触发（第 2 种）：给了 --bot-token 就再起一个 Bot 客户端
+    # 用户把帖子转发给这个 Bot，Bot 收到带来源的转发就入队，真正搬运还是用上面的用户号
+    bot_client = None
+    bot_me = None
+    if (args.bot_token or "").strip():
+        bot_client = TelegramClient(args.bot_session, args.api_id, args.api_hash)
+        await bot_client.start(bot_token=args.bot_token.strip())
+        bot_me = await bot_client.get_me()
+        print(f"Bot 已登录：@{getattr(bot_me, 'username', '')}（{bot_me.id}），把帖子转发给这个 Bot 就开始搬。", flush=True)
+        print("Bot 里也能发命令：/set_dest @新频道、/dest、/traffic、/today、/help", flush=True)
+
     queue = asyncio.Queue()
     recent = {}  # (频道, 帖ID) -> 时间戳，去重：同一条 5 分钟内只搬一次
 
@@ -577,10 +677,10 @@ async def main():
                 await event.reply(f"收到，开始搬 {src_ref} / {src_post_id} 到 {dest_now}……")
                 dest_id, total, done = await copy_one(
                     client, src_ref, src_post_id, dest_now, tmpdir, limit=args.limit,
-                    max_file_mb=args.max_file_mb, max_cache_mb=args.max_cache_mb,
-                    min_free_mb=args.min_free_mb,
-                    traffic_file=args.traffic_file, traffic_limit_gb=args.traffic_limit_gb,
-                    traffic_mode=args.traffic_mode, traffic_state=traffic_state)
+                    max_file_mb=settings_holder["max_file_mb"], max_cache_mb=settings_holder["max_cache_mb"],
+                    min_free_mb=settings_holder["min_free_mb"],
+                    traffic_file=args.traffic_file, traffic_limit_gb=settings_holder["traffic_limit_gb"],
+                    traffic_mode=settings_holder["traffic_mode"], traffic_state=traffic_state)
                 if total == 0:
                     await event.reply(f"搬完了：新帖 {dest_id}（在 {dest_now}），源帖没有评论串，只搬了帖子本身。")
                 else:
@@ -600,20 +700,26 @@ async def main():
     async def daily_report_loop():
         """每天早上 8 点（北京时间）推昨日流量统计到收藏夹/主号私聊。
         启动时如果昨天已过 8 点还没推过，就先补推一次，避免重启漏推。"""
-        if not args.daily_report_hour:
-            return
         target = me.id if args.self_mode else master_id
         while True:
             try:
+                _hour = int(settings_holder.get("daily_report_hour", 8) or 0)
+                if not _hour:
+                    await asyncio.sleep(3600)
+                    continue
                 now = datetime.now(TZ)
                 # 昨天的日期
                 yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
                 # 今天 8 点
-                today_report = now.replace(hour=args.daily_report_hour, minute=0, second=0, microsecond=0)
+                today_report = now.replace(hour=_hour, minute=0, second=0, microsecond=0)
                 if now >= today_report and traffic_state.get("last_report") != yesterday:
                     # 到了今天 8 点还没推昨天，就推
-                    text = daily_report_text(traffic_state, args.traffic_limit_gb, args.traffic_mode, yesterday)
-                    await client.send_message(target, text)
+                    text = daily_report_text(traffic_state, settings_holder["traffic_limit_gb"], settings_holder["traffic_mode"], yesterday)
+                    # 只往 Bot 里推，不往收藏夹里推了
+                    if bot_client is not None:
+                        await bot_client.send_message(master_id, text)
+                    else:
+                        await client.send_message(target, text)
                     traffic_state["last_report"] = yesterday
                     save_traffic_state(args.traffic_file, traffic_state)
                     print(f"已推昨日流量统计：{yesterday}", flush=True)
@@ -626,20 +732,269 @@ async def main():
 
     asyncio.create_task(daily_report_loop())
 
-    @client.on(events.NewMessage)
-    async def handler(event):
-        # 只认两处：自己的收藏夹（chat_id == 自己），或主号发来的私聊
-        # 注意：收藏夹里的消息是你自己发出去的，out=True，所以不能只听 incoming
-        is_saved = event.chat_id == me.id
-        is_private_from_master = event.is_private and event.sender_id == master_id
-        if not (is_saved or is_private_from_master):
-            return
+    # 命令 + 转发处理，供用户号和 Bot 共用：Bot 收到带来源的转发也走这里入队
+    # 菜单输入状态：点菜单按钮后，下一步发的消息当成那个设置的输入值
+    pending_input = {"type": None}
+
+    def persist_settings():
+        save_settings(settings_holder)
+
+    def bound_list_text():
+        b = settings_holder.get("bound_channels", []) or []
+        if not b:
+            return "还没绑定频道，发 /bind @频道 来绑定，最多绑 8 个。"
+        lines = []
+        for i, c in enumerate(b, 1):
+            cur = " ← 当前" if str(c.get("id")) == str(dest_holder["channel"]) else ""
+            lines.append(f"{i}. {c.get('title') or c.get('id')}（{c.get('id')}）{cur}")
+        return "已绑定频道：\n" + "\n".join(lines)
+
+    async def send_menu(event):
+        """Bot 菜单：/start 后显示，点按钮设置，不用记命令。"""
+        b = settings_holder.get("bound_channels", []) or []
+        rows = []
+        # 绑定频道切换：每个已绑定频道一个按钮，点一下就切过去
+        for c in b[:8]:
+            rows.append([Button.inline(f"📺 {c.get('title') or c.get('id')}", f"dest:{c.get('id')}".encode()[:64])])
+        rows.append([Button.inline("➕ 绑定新频道", b"bind_new"), Button.inline("🗑️ 删除绑定", b"del_bind")])
+        rows.append([Button.inline("📊 流量", b"menu_traffic"), Button.inline("📅 今日", b"menu_today")])
+        rows.append([Button.inline("⚙️ 流量限额", b"menu_limit"), Button.inline("🔄 清零日", b"menu_day")])
+        rows.append([Button.inline("📁 单文件上限", b"menu_maxfile"), Button.inline("🗂️ 缓存上限", b"menu_maxcache")])
+        rows.append([Button.inline("💾 磁盘预留", b"menu_minfree"), Button.inline("⏰ 日报时间", b"menu_hour")])
+        rows.append([Button.inline("🔀 流量计费", b"menu_mode"), Button.inline("❓ 帮助", b"menu_help")])
+        _d = dest_holder["channel"] if dest_holder["channel"] else "还没设"
+        await event.reply(
+            f"菜单（当前目标：{_d}，已绑 {len(b)} 个频道）\n"
+            f"点下面按钮切换频道或改设置，改完重启也记得住。",
+            buttons=rows)
+
+    async def process_event(event):
         text = (event.message.text or "").strip()
+        # 菜单等待输入：点按钮后发的下一条消息当成输入值
+        if pending_input.get("type") and not text.startswith("/"):
+            ptype = pending_input["type"]
+            pending_input["type"] = None
+            if ptype == "bind":
+                new_dest = parse_dest(text)
+                try:
+                    ent = await client.get_entity(new_dest)
+                    title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(new_dest)
+                except Exception as e:
+                    await event.reply(f"绑定失败，找不到这个频道：{e}")
+                    return
+                b = settings_holder.get("bound_channels", []) or []
+                if len(b) >= 8:
+                    await event.reply("最多绑 8 个频道，先发 /unbind @频道 解绑一个再绑。")
+                    return
+                if any(str(c.get("id")) == str(new_dest) for c in b):
+                    await event.reply(f"这个频道已经绑过了：{title}（{new_dest}）")
+                    return
+                b.append({"id": str(new_dest), "title": title})
+                settings_holder["bound_channels"] = b
+                persist_settings()
+                await event.reply(f"已绑定：{title}（{new_dest}），以后在菜单里点一下就能切过去。")
+                return
+            if ptype == "traffic_limit":
+                try:
+                    v = float(text)
+                    if v < 0:
+                        raise ValueError()
+                except ValueError:
+                    await event.reply("流量限额要是数字，单位 GB，比如 5000，0 = 不限。")
+                    return
+                settings_holder["traffic_limit_gb"] = v
+                persist_settings()
+                await event.reply(f"已改流量限额：{v}GB，0 = 不限。")
+                return
+            if ptype == "traffic_mode":
+                if text not in ("both", "out"):
+                    await event.reply("流量计费只能填 both（双向 x2）或 out（只算出站 x1）。")
+                    return
+                settings_holder["traffic_mode"] = text
+                persist_settings()
+                await event.reply(f"已改流量计费：{text}。")
+                return
+            if ptype in ("max_file", "max_cache", "min_free"):
+                try:
+                    v = int(text)
+                    if v < 0:
+                        raise ValueError()
+                except ValueError:
+                    await event.reply("要是数字，单位 MB，比如 10240。")
+                    return
+                key = {"max_file": "max_file_mb", "max_cache": "max_cache_mb", "min_free": "min_free_mb"}[ptype]
+                settings_holder[key] = v
+                persist_settings()
+                await event.reply(f"已改：{key} = {v}MB。")
+                return
+            if ptype == "report_hour":
+                try:
+                    v = int(text)
+                    if v < 0 or v > 23:
+                        raise ValueError()
+                except ValueError:
+                    await event.reply("日报时间要是 0-23 的数字，0 = 不推，比如 8。")
+                    return
+                settings_holder["daily_report_hour"] = v
+                persist_settings()
+                await event.reply(f"已改日报时间：每天 {v} 点推，0 = 不推。")
+                return
+            if ptype == "traffic_day":
+                try:
+                    v = int(text)
+                    if v < 1 or v > 28:
+                        raise ValueError()
+                except ValueError:
+                    await event.reply("清零日只能是 1-28。")
+                    return
+                traffic_state["reset_day"] = v
+                save_traffic_state(args.traffic_file, traffic_state)
+                await event.reply(f"已改成每月 {v} 号清零流量。")
+                return
+        # --- 菜单 ---
+        if text in ("/start", "/menu", "/菜单"):
+            await send_menu(event)
+            return
+        if text.startswith("/bind") or text.startswith("/绑定"):
+            parts = text.split(None, 1)
+            if len(parts) < 2 or not parts[1].strip():
+                pending_input["type"] = "bind"
+                await event.reply("发一个要绑定的频道过来，比如 @你的频道 或 -1001234567890")
+                return
+            pending_input["type"] = "bind"
+            # 复用上面的输入处理：把这条当成输入值
+            text = parts[1].strip()
+            # 直接走 bind 输入逻辑
+            new_dest = parse_dest(text)
+            try:
+                ent = await client.get_entity(new_dest)
+                title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(new_dest)
+            except Exception as e:
+                await event.reply(f"绑定失败，找不到这个频道：{e}")
+                pending_input["type"] = None
+                return
+            b = settings_holder.get("bound_channels", []) or []
+            if len(b) >= 8:
+                await event.reply("最多绑 8 个频道，先发 /unbind @频道 解绑一个再绑。")
+                pending_input["type"] = None
+                return
+            if any(str(c.get("id")) == str(new_dest) for c in b):
+                await event.reply(f"这个频道已经绑过了：{title}（{new_dest}）")
+                pending_input["type"] = None
+                return
+            b.append({"id": str(new_dest), "title": title})
+            settings_holder["bound_channels"] = b
+            persist_settings()
+            pending_input["type"] = None
+            await event.reply(f"已绑定：{title}（{new_dest}），以后在菜单里点一下就能切过去。")
+            return
+        if text.startswith("/unbind") or text.startswith("/解绑"):
+            parts = text.split(None, 1)
+            if len(parts) < 2 or not parts[1].strip():
+                await event.reply(f"用法：/unbind @频道\n{bound_list_text()}")
+                return
+            target = parse_dest(parts[1].strip())
+            b = settings_holder.get("bound_channels", []) or []
+            nb = [c for c in b if str(c.get("id")) != str(target)]
+            if len(nb) == len(b):
+                await event.reply(f"没找到这个绑定：{target}\n{bound_list_text()}")
+                return
+            settings_holder["bound_channels"] = nb
+            persist_settings()
+            await event.reply(f"已解绑：{target}\n{bound_list_text()}")
+            return
+        if text in ("/bound", "/已绑定", "/bindlist"):
+            await event.reply(bound_list_text())
+            return
+        if text.startswith("/set_traffic_limit"):
+            parts = text.split()
+            if len(parts) < 2:
+                pending_input["type"] = "traffic_limit"
+                await event.reply(f"发一个新的流量限额过来，单位 GB，比如 5000，0 = 不限。当前是 {settings_holder['traffic_limit_gb']}GB。")
+                return
+            try:
+                v = float(parts[1])
+            except ValueError:
+                await event.reply("流量限额要是数字，单位 GB，比如 5000，0 = 不限。")
+                return
+            settings_holder["traffic_limit_gb"] = v
+            persist_settings()
+            await event.reply(f"已改流量限额：{v}GB，0 = 不限。")
+            return
+        if text.startswith("/set_traffic_mode"):
+            parts = text.split()
+            if len(parts) < 2:
+                pending_input["type"] = "traffic_mode"
+                await event.reply(f"发 both（双向 x2）或 out（只算出站 x1）过来。当前是 {settings_holder['traffic_mode']}。")
+                return
+            if parts[1] not in ("both", "out"):
+                await event.reply("只能填 both 或 out。")
+                return
+            settings_holder["traffic_mode"] = parts[1]
+            persist_settings()
+            await event.reply(f"已改流量计费：{parts[1]}。")
+            return
+        if text.startswith("/set_maxfile"):
+            parts = text.split()
+            if len(parts) < 2:
+                pending_input["type"] = "max_file"
+                await event.reply(f"发一个新的单文件上限过来，单位 MB，比如 10240。当前是 {settings_holder['max_file_mb']}MB。")
+                return
+            try:
+                settings_holder["max_file_mb"] = int(parts[1])
+                persist_settings()
+                await event.reply(f"已改单文件上限：{parts[1]}MB。")
+            except ValueError:
+                await event.reply("要是数字，单位 MB，比如 10240。")
+            return
+        if text.startswith("/set_cache"):
+            parts = text.split()
+            if len(parts) < 2:
+                pending_input["type"] = "max_cache"
+                await event.reply(f"发一个新的缓存上限过来，单位 MB，比如 10240。当前是 {settings_holder['max_cache_mb']}MB。")
+                return
+            try:
+                settings_holder["max_cache_mb"] = int(parts[1])
+                persist_settings()
+                await event.reply(f"已改缓存上限：{parts[1]}MB。")
+            except ValueError:
+                await event.reply("要是数字，单位 MB，比如 10240。")
+            return
+        if text.startswith("/set_minfree"):
+            parts = text.split()
+            if len(parts) < 2:
+                pending_input["type"] = "min_free"
+                await event.reply(f"发一个新的磁盘预留过来，单位 MB，比如 500。当前是 {settings_holder['min_free_mb']}MB。")
+                return
+            try:
+                settings_holder["min_free_mb"] = int(parts[1])
+                persist_settings()
+                await event.reply(f"已改磁盘预留：{parts[1]}MB。")
+            except ValueError:
+                await event.reply("要是数字，单位 MB，比如 500。")
+            return
+        if text.startswith("/set_report_hour") or text.startswith("/set_hour"):
+            parts = text.split()
+            if len(parts) < 2:
+                pending_input["type"] = "report_hour"
+                await event.reply(f"发一个新的日报时间过来，0-23，比如 8，0 = 不推。当前是 {settings_holder['daily_report_hour']} 点。")
+                return
+            try:
+                v = int(parts[1])
+                if v < 0 or v > 23:
+                    raise ValueError()
+                settings_holder["daily_report_hour"] = v
+                persist_settings()
+                await event.reply(f"已改日报时间：每天 {v} 点推，0 = 不推。")
+            except ValueError:
+                await event.reply("日报时间要是 0-23 的数字，0 = 不推。")
+            return
         # --- 先处理换频道命令，不用上服务器 ---
         if text.startswith("/set_dest") or text.startswith("/set_channel") or text.startswith("/目标频道"):
             parts = text.split(None, 1)
             if len(parts) < 2 or not parts[1].strip():
-                await event.reply("用法：/set_dest @新频道 或 /set_dest -1001234567890")
+                # 没给频道就显示已绑定的，点一下就能切
+                await event.reply(f"发一个频道过来，比如 @新频道 或 -1001234567890\n\n{bound_list_text()}\n\n也可以发 /start 打开菜单点一下切换。")
                 return
             new_dest = parse_dest(parts[1].strip())
             try:
@@ -659,19 +1014,29 @@ async def main():
             else:
                 await event.reply("还没设目标频道，发 /set_dest @新频道 来设。")
             return
-        if text in ("/help", "/start", "/帮助"):
+        if text in ("/help", "/帮助"):
             _d = dest_holder["channel"] if dest_holder["channel"] else "还没设，发 /set_dest @新频道"
             await event.reply(
                 "用法：\n"
                 "· 转发喜欢的频道帖子到收藏夹（或发给我），自动搬到目标频道\n"
+                "· 也可以转发给 Bot（给了 --bot-token 时）：转发到 Bot 会带来源，第三方转发到收藏夹不带来源时用这个\n"
+                "· 发 /start 打开菜单，点按钮切换频道或改设置\n"
                 "· /set_dest @新频道：设 / 换目标频道\n"
+                "· /bind @频道：绑定频道（最多 5 个），/bound 看已绑定的，/unbind @频道 解绑\n"
                 "· /dest：看当前目标频道\n"
                 "· /cache：看缓存限制（单文件/一批/剩余磁盘）\n"
                 "· /traffic：看本账期流量已用 / 还剩多少\n"
                 "· /today：看当日用了多少流量\n"
                 "· /set_traffic_day 15：改每月几号清零流量（1-28）\n"
-                f"· 每天早上 {args.daily_report_hour} 点自动推昨日流量统计\n"
-                f"· 当前目标频道：{_d}")
+                "· /set_traffic_limit 5000：改流量限额 GB，0 = 不限\n"
+                "· /set_traffic_mode both/out：改流量计费\n"
+                "· /set_maxfile 10240：改单文件上限 MB\n"
+                "· /set_cache 10240：改缓存上限 MB\n"
+                "· /set_minfree 500：改磁盘预留 MB\n"
+                "· /set_report_hour 8：改日报时间，0 = 不推\n"
+                f"· 每天早上 {settings_holder['daily_report_hour']} 点自动推昨日流量统计\n"
+                f"· 当前目标频道：{_d}\n"
+                f"· {bound_list_text()}")
             return
         if text.startswith("/set_traffic_day"):
             parts = text.split()
@@ -710,13 +1075,15 @@ async def main():
             nxt = next_reset_for(datetime.now(TZ).date(), traffic_state.get("reset_day", 1))
             today = _today_str()
             td = (traffic_state.get("days", {}) or {}).get(today, {"bytes": 0, "files": 0})
-            if args.traffic_limit_gb:
+            _lim = settings_holder["traffic_limit_gb"]
+            _mode = settings_holder["traffic_mode"]
+            if _lim:
                 await event.reply(
-                    f"流量（{args.traffic_mode}，x{traffic_mult(args.traffic_mode)}）：\n"
+                    f"流量（{_mode}，x{traffic_mult(_mode)}）：\n"
                     f"今日 {today} 用了 {td['bytes'] / 1024**3:.2f}GB（{td['files']} 个文件）\n"
                     f"本账期 {cur_month} 起已用 {cur_used / 1024**3:.2f}GB / "
-                    f"限额 {args.traffic_limit_gb}GB\n"
-                    f"还剩 {args.traffic_limit_gb - cur_used / 1024**3:.2f:.2f}GB，"
+                    f"限额 {_lim}GB\n"
+                    f"还剩 {_lim - cur_used / 1024**3:.2f:.2f}GB，"
                     f"每月 {traffic_state.get('reset_day', 1)} 号清零，下次 {nxt}，"
                     f"超了会自动停。")
             else:
@@ -726,19 +1093,20 @@ async def main():
             today = _today_str()
             td = (traffic_state.get("days", {}) or {}).get(today, {"bytes": 0, "files": 0})
             used_gb = traffic_state["used"] / 1024**3
-            if args.traffic_limit_gb:
+            _lim = settings_holder["traffic_limit_gb"]
+            if _lim:
                 await event.reply(
                     f"当日流量（{today}）：用了 {td['bytes'] / 1024**3:.2f}GB，搬了 {td['files']} 个文件\n"
-                    f"本账期累计用了 {used_gb:.2f}GB / {args.traffic_limit_gb}GB，"
-                    f"还剩 {args.traffic_limit_gb - used_gb:.2f}GB。")
+                    f"本账期累计用了 {used_gb:.2f}GB / {_lim}GB，"
+                    f"还剩 {_lim - used_gb:.2f}GB。")
             else:
                 await event.reply(f"当日流量（{today}）：用了 {td['bytes'] / 1024**3:.2f}GB，搬了 {td['files']} 个文件。")
             return
         if text in ("/cache", "/缓存"):
             free = shutil.disk_usage(".").free / (1024 * 1024)
             await event.reply(
-                f"缓存限制：单文件 {args.max_file_mb}MB，一批 {args.max_cache_mb}MB，"
-                f"磁盘剩余低于 {args.min_free_mb}MB 就停。\n"
+                f"缓存限制：单文件 {settings_holder['max_file_mb']}MB，一批 {settings_holder['max_cache_mb']}MB，"
+                f"磁盘剩余低于 {settings_holder['min_free_mb']}MB 就停。\n"
                 f"当前磁盘剩余约 {free:.0f}MB。发完一批立即删，不会一直占着。")
             return
         src_ref = src_post_id = None
@@ -767,7 +1135,139 @@ async def main():
         await queue.put((event, src_ref, src_post_id))
         print(f"已入队：{src_ref} / {src_post_id}，队列 {queue.qsize()} 条", flush=True)
 
-    await client.run_until_disconnected()
+    async def handle_callback(event):
+        # 菜单按钮回调：只认主号点的
+        if event.sender_id != master_id:
+            await event.answer("不是你的 Bot。")
+            return
+        data = (event.data or b"").decode(errors="ignore")
+        # 切换目标频道：点已绑定的频道
+        if data.startswith("dest:"):
+            target = data[5:]
+            dest_holder["channel"] = parse_dest(target)
+            save_dest_to_file(dest_holder["channel"])
+            await event.answer("已切换")
+            await event.edit(f"已换目标频道：{target}，之后转发的都搬到这里。")
+            return
+        if data == "bind_new":
+            pending_input["type"] = "bind"
+            await event.answer()
+            await event.respond("发一个要绑定的频道过来，比如 @你的频道 或 -1001234567890")
+            return
+        if data == "del_bind":
+            await event.answer()
+            b = settings_holder.get("bound_channels", []) or []
+            if not b:
+                await event.respond("还没绑定频道，没什么可删的。")
+                return
+            rows = []
+            for c in b[:8]:
+                rows.append([Button.inline(f"❌ {c.get('title') or c.get('id')}", f"unbind:{c.get('id')}".encode()[:64])])
+            rows.append([Button.inline("↩️ 返回菜单", b"menu_back")])
+            await event.respond("点一下要删除的绑定频道：", buttons=rows)
+            return
+        if data.startswith("unbind:"):
+            target = data[7:]
+            b = settings_holder.get("bound_channels", []) or []
+            nb = [c for c in b if str(c.get("id")) != str(target)]
+            if len(nb) == len(b):
+                await event.answer("没找到这个绑定")
+                return
+            settings_holder["bound_channels"] = nb
+            persist_settings()
+            await event.answer("已删除")
+            await event.edit(f"已删除绑定：{target}\n{bound_list_text()}")
+            return
+        if data == "menu_back":
+            await event.answer()
+            await send_menu(event)
+            return
+        if data == "menu_traffic":
+            await event.answer()
+            _cur = load_traffic_state(args.traffic_file, reset_day=traffic_state.get("reset_day", 1))
+            _lim = settings_holder["traffic_limit_gb"]
+            _mode = settings_holder["traffic_mode"]
+            await event.respond(f"本账期 {_cur['month']} 起已用 {_cur['used'] / 1024**3:.2f}GB / 限额 {_lim}GB（{_mode}），每月 {traffic_state.get('reset_day', 1)} 号清零。")
+            return
+        if data == "menu_today":
+            await event.answer()
+            _today = _today_str()
+            _td = (traffic_state.get("days", {}) or {}).get(_today, {"bytes": 0, "files": 0})
+            await event.respond(f"当日流量（{_today}）：用了 {_td['bytes'] / 1024**3:.2f}GB，搬了 {_td['files']} 个文件。")
+            return
+        if data == "menu_limit":
+            pending_input["type"] = "traffic_limit"
+            await event.answer()
+            await event.respond(f"发一个新的流量限额过来，单位 GB，比如 5000，0 = 不限。当前是 {settings_holder['traffic_limit_gb']}GB。")
+            return
+        if data == "menu_day":
+            pending_input["type"] = "traffic_day"
+            await event.answer()
+            await event.respond(f"发一个新的清零日过来，1-28，比如 15。当前每月 {traffic_state.get('reset_day', 1)} 号清零。")
+            return
+        if data == "menu_maxfile":
+            pending_input["type"] = "max_file"
+            await event.answer()
+            await event.respond(f"发一个新的单文件上限过来，单位 MB，比如 10240。当前是 {settings_holder['max_file_mb']}MB。")
+            return
+        if data == "menu_maxcache":
+            pending_input["type"] = "max_cache"
+            await event.answer()
+            await event.respond(f"发一个新的缓存上限过来，单位 MB，比如 10240。当前是 {settings_holder['max_cache_mb']}MB。")
+            return
+        if data == "menu_minfree":
+            pending_input["type"] = "min_free"
+            await event.answer()
+            await event.respond(f"发一个新的磁盘预留过来，单位 MB，比如 500。当前是 {settings_holder['min_free_mb']}MB。")
+            return
+        if data == "menu_hour":
+            pending_input["type"] = "report_hour"
+            await event.answer()
+            await event.respond(f"发一个新的日报时间过来，0-23，比如 8，0 = 不推。当前是 {settings_holder['daily_report_hour']} 点。")
+            return
+        if data == "menu_mode":
+            pending_input["type"] = "traffic_mode"
+            await event.answer()
+            await event.respond(f"发 both（双向 x2）或 out（只算出站 x1）过来。当前是 {settings_holder['traffic_mode']}。")
+            return
+        if data == "menu_help":
+            await event.answer()
+            await event.respond("发 /help 看全部命令，发 /start 打开菜单。")
+            return
+        await event.answer()
+
+    @client.on(events.NewMessage)
+    async def handler(event):
+        # 用户号只认两处：自己的收藏夹（chat_id == 自己），或主号发来的私聊
+        # 注意：收藏夹里的消息是你自己发出去的，out=True，所以不能只听 incoming
+        is_saved = event.chat_id == me.id
+        is_private_from_master = event.is_private and event.sender_id == master_id
+        if not (is_saved or is_private_from_master):
+            return
+        await process_event(event)
+
+    @client.on(events.CallbackQuery)
+    async def user_callback(event):
+        await handle_callback(event)
+
+    if bot_client is not None:
+        @bot_client.on(events.NewMessage)
+        async def bot_handler(event):
+            # Bot 只认主号发来的私聊（转发给 Bot 的帖子），别人发来的不认
+            if not event.is_private or event.sender_id != master_id:
+                return
+            await process_event(event)
+
+        @bot_client.on(events.CallbackQuery)
+        async def bot_callback(event):
+            await handle_callback(event)
+        print("Bot 触发已开启：把帖子转发给 Bot 就开始搬。", flush=True)
+        await asyncio.gather(
+            client.run_until_disconnected(),
+            bot_client.run_until_disconnected(),
+        )
+    else:
+        await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
