@@ -71,6 +71,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetDiscussionMessageRequest
 from telethon.tl.types import PeerChannel
 
@@ -411,9 +412,45 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                 comments = []
                 has_comments = False
         except Exception as e2:
-            print(f"源帖没有评论串（{e2}），只搬帖子本身", flush=True)
-            comments = []
-            has_comments = False
+            print(f"直接读回复也失败（{e2}），改用讨论组找根消息试试……", flush=True)
+            # 第三办法：拿频道的 linked 讨论组，在讨论组里找转发了这条主帖的根消息，再读它的回复
+            try:
+                _full = await client(GetFullChannelRequest(src_entity))
+                _linked_id = getattr(_full.full_chat, "linked_chat_id", None)
+                if not _linked_id:
+                    print("源帖没有评论串（频道没绑讨论组），只搬帖子本身", flush=True)
+                    comments = []
+                    has_comments = False
+                else:
+                    _linked = await client.get_entity(PeerChannel(_linked_id))
+                    _root = None
+                    async for _m in client.iter_messages(_linked, limit=50):
+                        _fwd = getattr(_m, "fwd_from", None)
+                        if _fwd and getattr(_fwd, "channel_post", None) == src_post_id:
+                            _root = _m
+                            break
+                    if not _root:
+                        print("源帖没有评论串（讨论组里没找到根消息），只搬帖子本身", flush=True)
+                        comments = []
+                        has_comments = False
+                    else:
+                        print(f"讨论组里找到根 {_root.id}，开始读评论……", flush=True)
+                        async for m in client.iter_messages(_linked, reply_to=_root.id):
+                            comments.append(m)
+                            if limit and len(comments) >= limit:
+                                break
+                        if comments:
+                            comments.reverse()
+                            has_comments = True
+                            print(f"讨论组里拿到源评论共 {len(comments)} 条", flush=True)
+                        else:
+                            print("源帖没有评论串，只搬帖子本身", flush=True)
+                            comments = []
+                            has_comments = False
+            except Exception as e3:
+                print(f"源帖没有评论串（{e3}），只搬帖子本身", flush=True)
+                comments = []
+                has_comments = False
 
     # 目标频道发新帖（重新下载再上传，不带转发来源）
     # 第 2 种：标题里一个字下面藏着链接、加粗等，用原 entities 原样搬
@@ -423,6 +460,11 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
     if src_post.media:
         src_files = []
         caption = src_group[0].text or None
+        # 原标题里带的 ** 是 Markdown 加粗的残留，搬过去会原样显示出来，先去掉，
+        # #话题 留在纯文字里也能点、也能搜，不用靠 entities
+        if caption and "**" in caption:
+            caption = caption.replace("**", "")
+            src_entities = None
         for m in src_group:
             if not m.media:
                 continue
@@ -477,9 +519,14 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
         finally:
             delete_files(src_files)
     else:
+        _txt = src_post.text or "(无文字)"
+        _ents = src_entities
+        if "**" in _txt:
+            _txt = _txt.replace("**", "")
+            _ents = None
         dest_post = await send_with_floodwait(
-            lambda: client.send_message(dest_channel, src_post.text or "(无文字)",
-                                        formatting_entities=src_entities, parse_mode=None,
+            lambda: client.send_message(dest_channel, _txt,
+                                        formatting_entities=_ents, parse_mode=None,
                                         buttons=src_buttons),
             "发新帖")
     print(f"目标新帖已发：{dest_post.id}", flush=True)
@@ -726,8 +773,8 @@ async def main():
                         _paths.append(_p)
                         _total_sz += Path(_p).stat().st_size
                         if _m.text:
-                            _cap = _m.text
-                            _entities = extract_entities(_m)
+                            _cap = _m.text.replace("**", "") if "**" in _m.text else _m.text
+                            _entities = extract_entities(_m) if "**" not in (_m.text or "") else None
                             _buttons = extract_buttons(_m)
                     if not _paths:
                         await event.reply("搬失败了：这个文件下载不了。")
