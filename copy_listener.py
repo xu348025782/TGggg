@@ -421,7 +421,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                     print("频道没绑讨论组，改用扫附近消息试试……", flush=True)
                     # 没绑讨论组时，回复可能就存在同一频道里，直接扫主帖后面 100 条
                     try:
-                        async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 100):
+                        async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 500):
                             _rt = getattr(_m, "reply_to_msg_id", None)
                             if _rt is None:
                                 _rh = getattr(_m, "reply_to", None)
@@ -473,7 +473,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                 print(f"讨论组办法也失败（{e3}），改用扫附近消息试试……", flush=True)
                 # 第四办法：直接扫主帖后面 100 条，看哪些是回复主帖的（有些频道回复就存在同一频道里）
                 try:
-                    async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 100):
+                    async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 500):
                         _rt = getattr(_m, "reply_to_msg_id", None)
                         if _rt is None:
                             _rh = getattr(_m, "reply_to", None)
