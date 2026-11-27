@@ -678,27 +678,55 @@ async def main():
                 if src_ref == "direct":
                     await event.reply(f"收到，开始搬（无来源，直接搬文件本身）到 {dest_now}……")
                     msg = event.message
-                    # 用收到这条消息的客户端（Bot）下载，再用用户号发到目标频道
                     dl_client = event.client or client
-                    path = await dl_client.download_media(msg, file=str(tmpdir / "file"))
-                    if not path:
+                    # 一组多个内容：等 2 秒让同一组的消息都到齐，再一起搬成一组相册
+                    _gid = getattr(msg, "grouped_id", None)
+                    _msgs = [msg]
+                    if _gid:
+                        await asyncio.sleep(2)
+                        try:
+                            _ids = list(range(max(1, msg.id - 10), msg.id + 11))
+                            _all = await dl_client.get_messages(event.chat_id, ids=_ids)
+                            _tmp = [m for m in (_all or []) if m and getattr(m, "grouped_id", None) == _gid and getattr(m, "media", None)]
+                            if len(_tmp) > 1:
+                                _msgs = sorted(_tmp, key=lambda m: m.id)
+                        except Exception:
+                            _msgs = [msg]
+                    await event.reply(f"收到，开始搬（无来源，直接搬文件本身，{_msgs.__len__()} 个）到 {dest_now}……")
+                    _paths = []
+                    _cap = ""
+                    _entities = []
+                    _buttons = []
+                    _total_sz = 0
+                    for _m in _msgs:
+                        _p = await dl_client.download_media(_m, file=str(tmpdir / f"file_{_m.id}"))
+                        if not _p:
+                            continue
+                        _paths.append(_p)
+                        _total_sz += Path(_p).stat().st_size
+                        if _m.text:
+                            _cap = _m.text
+                            _entities = extract_entities(_m)
+                            _buttons = extract_buttons(_m)
+                    if not _paths:
                         await event.reply("搬失败了：这个文件下载不了。")
                         continue
                     # 流量也记一下（下载+上传 x2 或 x1）
                     try:
-                        sz = Path(path).stat().st_size
                         traffic_state["used"] = check_and_reserve_traffic_state(
                             args.traffic_file, traffic_state,
-                            settings_holder["traffic_limit_gb"], settings_holder["traffic_mode"], int(sz))
+                            settings_holder["traffic_limit_gb"], settings_holder["traffic_mode"], int(_total_sz))
                     except Exception as _e:
                         await event.reply(f"搬失败了：{_e}")
                         continue
-                    entities = extract_entities(msg)
-                    buttons = extract_buttons(msg)
-                    cap = msg.text or ""
-                    sent = await client.send_file(
-                        dest_now, path, caption=cap or None,
-                        formatting_entities=entities, parse_mode=None, buttons=buttons)
+                    if len(_paths) == 1:
+                        sent = await client.send_file(
+                            dest_now, _paths[0], caption=_cap or None,
+                            formatting_entities=_entities, parse_mode=None, buttons=_buttons)
+                    else:
+                        sent = await client.send_file(
+                            dest_now, _paths, caption=_cap or None,
+                            formatting_entities=_entities, parse_mode=None, buttons=_buttons)
                     dest_id = sent.id if hasattr(sent, "id") else sent[0].id
                     await event.reply(f"搬完了：新帖 {dest_id}（在 {dest_now}），无来源直接搬的，没有评论串。")
                     continue
@@ -1187,10 +1215,14 @@ async def main():
                 if not dest_holder["channel"]:
                     await event.reply("还没设目标频道，先发 /set_dest @新频道 来设，设好再转发这条。")
                     return
-                key = ("direct", event.chat_id, event.message.id)
+                # 一组多个内容（相册）是多个消息共用一个 grouped_id，只入队一次，worker 里一次搬一组
+                _gid = getattr(event.message, "grouped_id", None)
+                if _gid:
+                    key = ("direct_group", event.chat_id, _gid)
+                else:
+                    key = ("direct", event.chat_id, event.message.id)
                 now = time.time()
                 if key in recent and now - recent[key] < 300:
-                    await event.reply("这条 5 分钟内已经搬过/正在搬，跳过。")
                     return
                 recent[key] = now
                 await queue.put((event, "direct", event.message.id))
