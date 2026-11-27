@@ -762,7 +762,24 @@ async def main():
         rows.append([Button.inline("📁 单文件上限", b"menu_maxfile"), Button.inline("🗂️ 缓存上限", b"menu_maxcache")])
         rows.append([Button.inline("💾 磁盘预留", b"menu_minfree"), Button.inline("⏰ 日报时间", b"menu_hour")])
         rows.append([Button.inline("🔀 流量计费", b"menu_mode"), Button.inline("❓ 帮助", b"menu_help")])
-        _d = dest_holder["channel"] if dest_holder["channel"] else "还没设"
+        _d_raw = dest_holder["channel"]
+        _d = "还没设"
+        if _d_raw:
+            # 先在已绑定里找名字，找到了就显示名字，不显示数字
+            _found = None
+            for _c in b:
+                if str(_c.get("id")) == str(_d_raw):
+                    _found = _c.get("title")
+                    break
+            if _found:
+                _d = _found
+            else:
+                # 没绑定过就现查一下名字，查不到才显示数字
+                try:
+                    _ent = await client.get_entity(parse_dest(str(_d_raw)))
+                    _d = getattr(_ent, "title", None) or getattr(_ent, "username", None) or str(_d_raw)
+                except Exception:
+                    _d = str(_d_raw)
         await event.reply(
             f"菜单（当前目标：{_d}，已绑 {len(b)} 个频道）\n"
             f"点下面按钮切换频道或改设置，改完重启也记得住。",
@@ -1010,7 +1027,21 @@ async def main():
             return
         if text in ("/dest", "/目标", "/current"):
             if dest_holder["channel"]:
-                await event.reply(f"当前目标频道：{dest_holder['channel']}")
+                _cur = dest_holder["channel"]
+                _name = None
+                for _c in (settings_holder.get("bound_channels", []) or []):
+                    if str(_c.get("id")) == str(_cur):
+                        _name = _c.get("title")
+                        break
+                if _name:
+                    await event.reply(f"当前目标频道：{_name}（{_cur}）")
+                else:
+                    try:
+                        _ent = await client.get_entity(parse_dest(str(_cur)))
+                        _t = getattr(_ent, "title", None) or getattr(_ent, "username", None) or str(_cur)
+                        await event.reply(f"当前目标频道：{_t}（{_cur}）")
+                    except Exception:
+                        await event.reply(f"当前目标频道：{_cur}")
             else:
                 await event.reply("还没设目标频道，发 /set_dest @新频道 来设。")
             return
