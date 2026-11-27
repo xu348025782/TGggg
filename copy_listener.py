@@ -674,6 +674,34 @@ async def main():
                 if not dest_now:
                     await event.reply("还没设目标频道，先发 /set_dest @新频道 来设，设好再转发这条。")
                     continue
+                # 无来源直接搬：Bot 收到的文件本身，没有原频道，不知道评论串，只能搬本身
+                if src_ref == "direct":
+                    await event.reply(f"收到，开始搬（无来源，直接搬文件本身）到 {dest_now}……")
+                    msg = event.message
+                    # 用收到这条消息的客户端（Bot）下载，再用用户号发到目标频道
+                    dl_client = event.client or client
+                    path = await dl_client.download_media(msg, file=str(tmpdir / "file"))
+                    if not path:
+                        await event.reply("搬失败了：这个文件下载不了。")
+                        continue
+                    # 流量也记一下（下载+上传 x2 或 x1）
+                    try:
+                        sz = Path(path).stat().st_size
+                        traffic_state["used"] = check_and_reserve_traffic_state(
+                            args.traffic_file, traffic_state,
+                            settings_holder["traffic_limit_gb"], settings_holder["traffic_mode"], int(sz))
+                    except Exception as _e:
+                        await event.reply(f"搬失败了：{_e}")
+                        continue
+                    entities = extract_entities(msg)
+                    buttons = extract_buttons(msg)
+                    cap = msg.text or ""
+                    sent = await client.send_file(
+                        dest_now, path, caption=cap or None,
+                        formatting_entities=entities, parse_mode=None, buttons=buttons)
+                    dest_id = sent.id if hasattr(sent, "id") else sent[0].id
+                    await event.reply(f"搬完了：新帖 {dest_id}（在 {dest_now}），无来源直接搬的，没有评论串。")
+                    continue
                 await event.reply(f"收到，开始搬 {src_ref} / {src_post_id} 到 {dest_now}……")
                 dest_id, total, done = await copy_one(
                     client, src_ref, src_post_id, dest_now, tmpdir, limit=args.limit,
@@ -1152,7 +1180,23 @@ async def main():
         if src_ref is None and event.message.text:
             src_ref, src_post_id = parse_link(event.message.text)
         if src_ref is None or not src_post_id:
-            # 没带转发也没带链接就静默忽略，不回“没看懂”，不然自己发的回执会循环触发
+            # 3) 没来源的直接转发：第三方把来源去掉了，但图片/视频本身还在 Bot 里，
+            # 直接把 Bot 收到的这个文件本身搬到目标频道，不用知道原频道。
+            # 注意：这种不知道原帖，就搬不了评论串，只能搬帖子本身。
+            if event.message.media:
+                if not dest_holder["channel"]:
+                    await event.reply("还没设目标频道，先发 /set_dest @新频道 来设，设好再转发这条。")
+                    return
+                key = ("direct", event.chat_id, event.message.id)
+                now = time.time()
+                if key in recent and now - recent[key] < 300:
+                    await event.reply("这条 5 分钟内已经搬过/正在搬，跳过。")
+                    return
+                recent[key] = now
+                await queue.put((event, "direct", event.message.id))
+                print(f"已入队（无来源直接搬）：Bot 消息 {event.message.id}，队列 {queue.qsize()} 条", flush=True)
+                return
+            # 没带转发也没带链接也没文件就静默忽略，不回“没看懂”，不然自己发的回执会循环触发
             return
         if not dest_holder["channel"]:
             await event.reply("还没设目标频道，先发 /set_dest @新频道 来设，设好再转发这条。")
