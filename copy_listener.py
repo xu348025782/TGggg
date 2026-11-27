@@ -214,6 +214,35 @@ def msg_file_size_mb(msg):
     return f.size / (1024 * 1024)
 
 
+def _is_photo_msg(m):
+    if getattr(m, "photo", None) is not None:
+        return True
+    f = getattr(m, "file", None)
+    return bool(f and (getattr(f, "mime_type", "") or "").startswith("image/"))
+
+
+def _is_video_msg(m):
+    if getattr(m, "video", None) is not None:
+        return True
+    f = getattr(m, "file", None)
+    return bool(f and (getattr(f, "mime_type", "") or "").startswith("video/"))
+
+
+def pick_preview(pool):
+    """相邻内容的预览：前 3 张图片（前面是视频就往后扫，跳过视频找图片）；
+    图片不足 3 张就只用第 1 张图片；一张图片也没有就用第 1 个视频；
+    既没图也没视频就用第 1 条。"""
+    photos = [m for m in pool if _is_photo_msg(m)]
+    if len(photos) >= 3:
+        return photos[:3]
+    if photos:
+        return photos[:1]
+    videos = [m for m in pool if _is_video_msg(m)]
+    if videos:
+        return videos[:1]
+    return pool[:1]
+
+
 def check_disk(tmpdir, min_free_mb, need_mb=0):
     free = shutil.disk_usage(tmpdir).free / (1024 * 1024)
     if free - need_mb < min_free_mb:
@@ -381,6 +410,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
     # --- 源评论串：有就读，没有也不报错，只搬帖子本身 ---
     comments = []
     has_comments = False
+    adjacent_scan = False  # 方法5：后面紧挨着扫出来的内容，不是真正的评论串
     try:
         disc = await client(GetDiscussionMessageRequest(peer=src_entity, msg_id=src_post_id))
         if disc.messages:
@@ -450,6 +480,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                                             break
                                 if comments:
                                     has_comments = True
+                                    adjacent_scan = True
                                     print(f"扫后面紧挨着拿到源内容共 {len(comments)} 条", flush=True)
                                 else:
                                     print("源帖没有评论串，只搬帖子本身", flush=True)
@@ -524,6 +555,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                                         break
                             if comments:
                                 has_comments = True
+                                adjacent_scan = True
                                 print(f"扫后面紧挨着拿到源内容共 {len(comments)} 条", flush=True)
                             else:
                                 print("源帖没有评论串，只搬帖子本身", flush=True)
@@ -543,7 +575,97 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
     # 第 3 种：图片下面的 inline 按钮，只搬 URL 按钮
     src_entities = extract_entities(src_group[0])
     src_buttons = extract_buttons(src_group[0])
-    if src_post.media:
+
+    # --- 相邻内容（方法5）的预览规则：只对后面紧挨着扫出来的内容生效，
+    # 真正的评论串（讨论组回复 / 直接回复）不受影响，仍按原来的总览+评论搬 ---
+    preview_dest_post = None
+    if adjacent_scan and comments:
+        # 总数 = 总览本身带媒体（有的话）+ 后面紧挨着的内容；总览纯文字时就是 comments 的条数
+        pool = [m for m in src_group if getattr(m, "media", None)] + list(comments)
+        total_items = len(pool)
+        _cap_text = (src_post.text or "")
+        _cap_ents = src_entities
+        if "**" in _cap_text:
+            _cap_text = _cap_text.replace("**", "")
+            _cap_ents = None
+        if not _cap_text.strip() and pool:
+            _cap_text = (pool[0].text or "")
+            if "**" in _cap_text:
+                _cap_text = _cap_text.replace("**", "")
+            _cap_ents = None
+        _cap_text = _cap_text.strip() or None
+        if total_items <= 10:
+            print(f"相邻内容共 {total_items} 条（≤10），直接搬一组，不放评论区", flush=True)
+            _files = []
+            for m in pool:
+                if max_file_mb and msg_file_size_mb(m) > max_file_mb:
+                    raise ValueError(f"源帖文件 {msg_file_size_mb(m):.0f}MB 超过上限 {max_file_mb}MB，已跳过")
+                traffic_state["used"] = check_and_reserve_traffic_state(
+                    traffic_file, traffic_state,
+                    traffic_limit_gb, traffic_mode, int(m.file.size or 0))
+                check_disk(tmpdir, min_free_mb, msg_file_size_mb(m))
+                p = await client.download_media(m, file=tmpdir)
+                if p:
+                    _files.append(p)
+            if not _files:
+                raise ValueError("源帖没有能下载的文件")
+            try:
+                if len(_files) == 1:
+                    preview_dest_post = await send_with_floodwait(
+                        lambda: client.send_file(dest_channel, _files[0], caption=_cap_text,
+                                                 formatting_entities=_cap_ents, parse_mode=None,
+                                                 buttons=src_buttons),
+                        "发新帖")
+                else:
+                    r = await send_with_floodwait(
+                        lambda: client.send_file(dest_channel, _files, caption=_cap_text,
+                                                 formatting_entities=_cap_ents, parse_mode=None,
+                                                 buttons=src_buttons),
+                        "发新帖")
+                    preview_dest_post = r[0] if isinstance(r, list) else r
+            finally:
+                delete_files(_files)
+            print(f"目标新帖已发（直接搬一组）：{preview_dest_post.id}", flush=True)
+            return preview_dest_post.id, 0, 0
+        # >10：先发预览帖（前 3 张图，不足 3 张用第 1 张图，没图用第 1 个视频），
+        # 再把全部内容（含预览那几张）搬进评论区
+        preview = pick_preview(pool)
+        print(f"相邻内容共 {total_items} 条（>10），预览用 {len(preview)} 个，评论区再搬全部 {total_items} 条", flush=True)
+        _files = []
+        for m in preview:
+            if max_file_mb and msg_file_size_mb(m) > max_file_mb:
+                raise ValueError(f"源帖文件 {msg_file_size_mb(m):.0f}MB 超过上限 {max_file_mb}MB，已跳过")
+            traffic_state["used"] = check_and_reserve_traffic_state(
+                traffic_file, traffic_state,
+                traffic_limit_gb, traffic_mode, int(m.file.size or 0))
+            check_disk(tmpdir, min_free_mb, msg_file_size_mb(m))
+            p = await client.download_media(m, file=tmpdir)
+            if p:
+                _files.append(p)
+        if not _files:
+            raise ValueError("源帖没有能下载的文件")
+        try:
+            if len(_files) == 1:
+                preview_dest_post = await send_with_floodwait(
+                    lambda: client.send_file(dest_channel, _files[0], caption=_cap_text,
+                                             formatting_entities=_cap_ents, parse_mode=None,
+                                             buttons=src_buttons),
+                    "发新帖（预览）")
+            else:
+                r = await send_with_floodwait(
+                    lambda: client.send_file(dest_channel, _files, caption=_cap_text,
+                                             formatting_entities=_cap_ents, parse_mode=None,
+                                             buttons=src_buttons),
+                    "发新帖（预览）")
+                preview_dest_post = r[0] if isinstance(r, list) else r
+        finally:
+            delete_files(_files)
+        print(f"预览帖已发：{preview_dest_post.id}", flush=True)
+        # 评论区搬全部，包含预览那几张
+        comments = pool
+    if preview_dest_post is not None:
+        dest_post = preview_dest_post
+    elif src_post.media:
         src_files = []
         caption = src_group[0].text or None
         # 原标题里带的 ** 是 Markdown 加粗的残留，搬过去会原样显示出来，先去掉，
