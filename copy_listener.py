@@ -1238,12 +1238,18 @@ async def main():
 
     @client.on(events.NewMessage)
     async def handler(event):
-        # 用户号只认两处：自己的收藏夹（chat_id == 自己），或主号发来的私聊
+        # 用户号只认两处：自己的收藏夹（chat_id == 自己），或主号发给这个号的私聊
         # 注意：收藏夹里的消息是你自己发出去的，out=True，所以不能只听 incoming
+        # 关键：发给 Bot 的消息也是 is_private + sender 是主号，但 chat_id 是 Bot 的 ID，
+        # 不能认，不然 Bot 里每条都会被用户号和 Bot 各处理一次，第二遍就报“5 分钟内已搬过”
         is_saved = event.chat_id == me.id
-        is_private_from_master = event.is_private and event.sender_id == master_id
-        if not (is_saved or is_private_from_master):
-            return
+        is_private_from_master = event.is_private and event.sender_id == master_id and event.chat_id == master_id
+        if args.self_mode:
+            if not is_saved:
+                return
+        else:
+            if not is_private_from_master:
+                return
         await process_event(event)
 
     @client.on(events.CallbackQuery)
