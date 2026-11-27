@@ -42,7 +42,7 @@ source venv/bin/activate
 pip install telethon
 ```
 
-6. 第一次前台跑，输手机号 + 验证码登录：
+6. 第一次前台跑，输手机号 + 验证码登录：+86XXXXXXX
 
 ```
 export TG_API_ID=你的api_id
