@@ -438,7 +438,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                         else:
                             print("没找到回复主帖的，改用扫后面紧挨着的内容试试……", flush=True)
                             try:
-                                async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 50):
+                                async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 500, reverse=True):
                                     if _m.id == src_post_id:
                                         continue
                                     _txt = _m.text or ""
@@ -449,7 +449,6 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                                         if limit and len(comments) >= limit:
                                             break
                                 if comments:
-                                    comments.reverse()
                                     has_comments = True
                                     print(f"扫后面紧挨着拿到源内容共 {len(comments)} 条", flush=True)
                                 else:
@@ -513,7 +512,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                         # 第五办法：后面紧挨着的、只有图没话题的，当成这个总览的内容
                         # 遇到带 #话题 的就停，那是下一个总览
                         try:
-                            async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 50):
+                            async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 500, reverse=True):
                                 if _m.id == src_post_id:
                                     continue
                                 _txt = _m.text or ""
@@ -524,7 +523,6 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                                     if limit and len(comments) >= limit:
                                         break
                             if comments:
-                                comments.reverse()
                                 has_comments = True
                                 print(f"扫后面紧挨着拿到源内容共 {len(comments)} 条", flush=True)
                             else:
