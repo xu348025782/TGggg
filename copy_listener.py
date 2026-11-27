@@ -8,8 +8,10 @@ copy_listener.py — 把喜欢的帖子转发给这个号，它就自动搬运
      （Saved Messages），它就自动搬。不用小号，也不用发链接。
 
 用法 B（没小号时用这个）：
-  python3 copy_listener.py --dest-channel "@你的频道" --self-mode \
+  python3 copy_listener.py --self-mode \
       --api-id 12345678 --api-hash "xxxx"
+  启动后在收藏夹发 /set_dest @你的频道 来设目标频道，
+  也可以启动时直接加 --dest-channel "@你的频道"。
   然后在手机里把喜欢的帖子转发到“收藏夹”就行。
 
 用法 A（有小号时用这个）：
@@ -474,7 +476,7 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
 async def main():
     ap = argparse.ArgumentParser(description="转发帖子给这个号，自动搬运带评论区的帖子")
     ap.add_argument("--dest-channel", default=os.environ.get("TG_DEST_CHANNEL", ""),
-                    help="目标频道，如 @my_channel 或 -100...")
+                    help="目标频道，如 @my_channel 或 -100...。可以不给，启动后在收藏夹发 /set_dest @新频道 来设")
     ap.add_argument("--master-id", type=int, default=int(os.environ.get("TG_MASTER_ID", "0") or 0),
                     help="有小号时填：只有这个用户 ID 发来的转发才会触发（就是你主号的数字 ID）；"
                          "用 --self-mode 时不用填，默认就是登录的这个号自己")
@@ -516,10 +518,12 @@ async def main():
         save_dest_to_file(dest_channel)
     else:
         saved = load_dest_from_file()
-        if not saved:
-            print("缺 --dest-channel（目标频道），第一次运行必须给一次，之后可在 Telegram 里用 /set_dest 换", file=sys.stderr)
-            sys.exit(2)
-        dest_channel = parse_dest(saved)
+        if saved:
+            dest_channel = parse_dest(saved)
+        else:
+            # 第一次也可以不给，启动后在收藏夹发 /set_dest 来设
+            dest_channel = None
+            print("还没设目标频道：启动后在收藏夹发 /set_dest @新频道 来设，设好再转发。", flush=True)
     if not args.self_mode and not args.master_id:
         print("缺 --master-id，或改用 --self-mode（没小号时用主号+收藏夹）", file=sys.stderr)
         sys.exit(2)
@@ -530,13 +534,14 @@ async def main():
     await client.start()
     me = await client.get_me()
     master_id = me.id if args.self_mode else args.master_id
-    print(f"监听号已登录：{me.id}，目标频道：{dest_holder['channel']}，只认：{master_id}"
+    _dest_txt = dest_holder["channel"] if dest_holder["channel"] else "还没设，在收藏夹发 /set_dest @新频道"
+    print(f"监听号已登录：{me.id}，目标频道：{_dest_txt}，只认：{master_id}"
           f"{'（主号+收藏夹模式）' if args.self_mode else ''}", flush=True)
     if args.self_mode:
         print("用法：把喜欢的频道帖子转发到自己的“收藏夹”就行，不用发链接。", flush=True)
     else:
         print("用法：把喜欢的频道帖子转发给这个号，或把帖子链接发给它。", flush=True)
-    print("换频道：在 Telegram 里发 /set_dest @新频道 即可，不用上服务器。", flush=True)
+    print("设频道：在 Telegram 里发 /set_dest @新频道 即可，不用上服务器。", flush=True)
 
     queue = asyncio.Queue()
     recent = {}  # (频道, 帖ID) -> 时间戳，去重：同一条 5 分钟内只搬一次
@@ -547,6 +552,9 @@ async def main():
             tmpdir = Path(tempfile.mkdtemp(prefix="copy_listener_"))
             try:
                 dest_now = dest_holder["channel"]
+                if not dest_now:
+                    await event.reply("还没设目标频道，先发 /set_dest @新频道 来设，设好再转发这条。")
+                    continue
                 await event.reply(f"收到，开始搬 {src_ref} / {src_post_id} 到 {dest_now}……")
                 dest_id, total, done = await copy_one(
                     client, src_ref, src_post_id, dest_now, tmpdir, limit=args.limit,
@@ -627,20 +635,24 @@ async def main():
             print(f"目标频道已改为：{new_dest}", flush=True)
             return
         if text in ("/dest", "/目标", "/current"):
-            await event.reply(f"当前目标频道：{dest_holder['channel']}")
+            if dest_holder["channel"]:
+                await event.reply(f"当前目标频道：{dest_holder['channel']}")
+            else:
+                await event.reply("还没设目标频道，发 /set_dest @新频道 来设。")
             return
         if text in ("/help", "/start", "/帮助"):
+            _d = dest_holder["channel"] if dest_holder["channel"] else "还没设，发 /set_dest @新频道"
             await event.reply(
                 "用法：\n"
                 "· 转发喜欢的频道帖子到收藏夹（或发给我），自动搬到目标频道\n"
-                "· /set_dest @新频道：换目标频道\n"
+                "· /set_dest @新频道：设 / 换目标频道\n"
                 "· /dest：看当前目标频道\n"
                 "· /cache：看缓存限制（单文件/一批/剩余磁盘）\n"
                 "· /traffic：看本账期流量已用 / 还剩多少\n"
                 "· /today：看当日用了多少流量\n"
                 "· /set_traffic_day 15：改每月几号清零流量（1-28）\n"
                 f"· 每天早上 {args.daily_report_hour} 点自动推昨日流量统计\n"
-                f"· 当前目标频道：{dest_holder['channel']}")
+                f"· 当前目标频道：{_d}")
             return
         if text.startswith("/set_traffic_day"):
             parts = text.split()
@@ -723,6 +735,9 @@ async def main():
             src_ref, src_post_id = parse_link(event.message.text)
         if src_ref is None or not src_post_id:
             # 没带转发也没带链接就静默忽略，不回“没看懂”，不然自己发的回执会循环触发
+            return
+        if not dest_holder["channel"]:
+            await event.reply("还没设目标频道，先发 /set_dest @新频道 来设，设好再转发这条。")
             return
         key = (str(src_ref), src_post_id)
         now = time.time()
