@@ -70,7 +70,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("Asia/Shanghai")
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetDiscussionMessageRequest
 from telethon.tl.types import PeerChannel
 
@@ -485,6 +485,10 @@ async def main():
                          "把帖子转发到收藏夹就触发，不用填 --master-id")
     ap.add_argument("--api-id", type=int, default=int(os.environ.get("TG_API_ID", "0") or 0))
     ap.add_argument("--api-hash", default=os.environ.get("TG_API_HASH", ""))
+    ap.add_argument("--phone", default=os.environ.get("TG_PHONE", ""),
+                    help="手机号，带 +86，如 +86138xxxxxxx。不填就运行时问你")
+    ap.add_argument("--force-sms", action="store_true",
+                    help="默认强制走应用内消息（777000），不走短信。加这个才强制走短信")
     ap.add_argument("--session", default="copy_listener")
     ap.add_argument("--limit", type=int, default=0, help="每条只搬前 N 条评论，0 = 全部")
     ap.add_argument("--max-file-mb", type=int, default=10240, help="单个文件超过这个 MB 就跳过，默认 10240（10G）")
@@ -531,7 +535,22 @@ async def main():
     dest_holder = {"channel": dest_channel}
 
     client = TelegramClient(args.session, args.api_id, args.api_hash)
-    await client.start()
+    await client.connect()
+    if not await client.is_user_authorized():
+        # 手动发码，强制走应用内消息（777000），不走短信
+        phone = (args.phone or "").strip() or input("手机号 (+86...): ").strip()
+        sent = await client.send_code_request(phone, force_sms=args.force_sms)
+        _t = type(sent.type).__name__ if getattr(sent, "type", None) else "应用内消息"
+        if args.force_sms:
+            print(f"验证码已强制发短信，请看短信：{_t}", flush=True)
+        else:
+            print(f"验证码已发到应用内消息，请打开手机 Telegram 看 777000 的消息：{_t}", flush=True)
+        code = input("请输入验证码: ").strip()
+        try:
+            await client.sign_in(phone, code)
+        except SessionPasswordNeededError:
+            pwd = input("请输入两步验证密码: ").strip()
+            await client.sign_in(password=pwd)
     me = await client.get_me()
     master_id = me.id if args.self_mode else args.master_id
     _dest_txt = dest_holder["channel"] if dest_holder["channel"] else "还没设，在收藏夹发 /set_dest @新频道"
