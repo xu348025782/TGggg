@@ -418,9 +418,31 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                 _full = await client(GetFullChannelRequest(src_entity))
                 _linked_id = getattr(_full.full_chat, "linked_chat_id", None)
                 if not _linked_id:
-                    print("源帖没有评论串（频道没绑讨论组），只搬帖子本身", flush=True)
-                    comments = []
-                    has_comments = False
+                    print("频道没绑讨论组，改用扫附近消息试试……", flush=True)
+                    # 没绑讨论组时，回复可能就存在同一频道里，直接扫主帖后面 100 条
+                    try:
+                        async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 100):
+                            _rt = getattr(_m, "reply_to_msg_id", None)
+                            if _rt is None:
+                                _rh = getattr(_m, "reply_to", None)
+                                if _rh is not None:
+                                    _rt = getattr(_rh, "reply_to_msg_id", None)
+                            if _rt == src_post_id:
+                                comments.append(_m)
+                                if limit and len(comments) >= limit:
+                                    break
+                        if comments:
+                            comments.reverse()
+                            has_comments = True
+                            print(f"扫附近拿到源评论共 {len(comments)} 条", flush=True)
+                        else:
+                            print("源帖没有评论串，只搬帖子本身", flush=True)
+                            comments = []
+                            has_comments = False
+                    except Exception as e4:
+                        print(f"源帖没有评论串（{e4}），只搬帖子本身", flush=True)
+                        comments = []
+                        has_comments = False
                 else:
                     _linked = await client.get_entity(PeerChannel(_linked_id))
                     _root = None
@@ -448,9 +470,31 @@ async def copy_one(client, src_ref, src_post_id, dest_channel, tmpdir, limit=0,
                             comments = []
                             has_comments = False
             except Exception as e3:
-                print(f"源帖没有评论串（{e3}），只搬帖子本身", flush=True)
-                comments = []
-                has_comments = False
+                print(f"讨论组办法也失败（{e3}），改用扫附近消息试试……", flush=True)
+                # 第四办法：直接扫主帖后面 100 条，看哪些是回复主帖的（有些频道回复就存在同一频道里）
+                try:
+                    async for _m in client.iter_messages(src_entity, min_id=src_post_id, max_id=src_post_id + 100):
+                        _rt = getattr(_m, "reply_to_msg_id", None)
+                        if _rt is None:
+                            _rh = getattr(_m, "reply_to", None)
+                            if _rh is not None:
+                                _rt = getattr(_rh, "reply_to_msg_id", None)
+                        if _rt == src_post_id:
+                            comments.append(_m)
+                            if limit and len(comments) >= limit:
+                                break
+                    if comments:
+                        comments.reverse()
+                        has_comments = True
+                        print(f"扫附近拿到源评论共 {len(comments)} 条", flush=True)
+                    else:
+                        print("源帖没有评论串，只搬帖子本身", flush=True)
+                        comments = []
+                        has_comments = False
+                except Exception as e4:
+                    print(f"源帖没有评论串（{e4}），只搬帖子本身", flush=True)
+                    comments = []
+                    has_comments = False
 
     # 目标频道发新帖（重新下载再上传，不带转发来源）
     # 第 2 种：标题里一个字下面藏着链接、加粗等，用原 entities 原样搬
